@@ -94,19 +94,34 @@ language-server/bin/php-language-server.php"))
     (haskell-mode . ("hie-wrapper"))
     (java-mode
      . ,(lambda ()
-          `("java"
-            "-Declipse.application=org.eclipse.jdt.ls.core.id1"
-            "-Dosgi.bundles.defaultStartLevel=4"
-            "-Declipse.product=org.eclipse.jdt.ls.core.product"
-            "-Dlog.protocol=true"
-            "-Dlog.level=ALL"
-            "-noverify"
-            "-Xmx1G"
-            "-jar" "plugins/org.eclipse.equinox.launcher_1.5.100.v20180611-1436.jar"
-            "-configuration" "config_mac"
-            "-data" ,(if-let ((proj (project-current)))
-                         (car (project-roots proj))
-                       default-directory)))))
+          (when-let* ((classpath (getenv "CLASSPATH"))
+                      (jar (cl-find-if
+                            (lambda (path)
+                              (string-match-p
+                               "org\\.eclipse\\.equinox\\.launcher_.*.jar$"
+                               (file-name-nondirectory path)))
+                            (split-string classpath ":")))
+                      (config
+                       (expand-file-name
+                        (cond
+                         ((string= system-type "darwin") "config_mac")
+                         ((string= system-type "windows-nt") "config_win")
+                         (t "config_linux"))
+                        (expand-file-name ".." (file-name-directory jar))))
+                      (workspace (locate-user-emacs-file "eglot-workspace")))
+            (cons 'eglot-eclipse-jdt
+                  (list (executable-find "java")
+                        "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=1044"
+                        "-Declipse.application=org.eclipse.jdt.ls.core.id1"
+                        "-Dosgi.bundles.defaultStartLevel=4"
+                        "-Declipse.product=org.eclipse.jdt.ls.core.product"
+                        "-Dlog.protocol=true"
+                        "-Dlog.level=ALL"
+                        "-noverify"
+                        "-Xmx1G"
+                        "-jar" jar
+                        "-configuration" config
+                        "-data" workspace))))))
   "How the command `eglot' guesses the server to start.
 An association list of (MAJOR-MODE . CONTACT) pairs.  MAJOR-MODE
 is a mode symbol, or a list of mode symbols.  The associated
@@ -1681,6 +1696,26 @@ If SKIP-SIGNATURE, don't try to send textDocument/signatureHelp."
          (cache (expand-file-name ".cquery_cached_index/" root)))
     (list :cacheDirectory (file-name-as-directory cache)
           :progressReportFrequencyMs -1)))
+
+
+;;; eclipse-jdt-specific
+;;;
+(defclass eglot-eclipse-jdt (eglot-lsp-server) ()
+  :documentation "eclipse's jdt langserver.")
+
+(cl-defmethod eglot-initialization-options ((server eglot-eclipse-jdt))
+  "Passes through required jdt initialization options"
+  `(:workspaceFolders
+    [,(eglot--path-to-uri (car (project-roots (eglot--project server))))]
+    ,@(if-let* ((home
+                 (or (getenv "JAVA_HOME")
+                     (ignore-errors
+                       (expand-file-name
+                        ".."
+                        (file-name-directory
+                         (file-chase-links (executable-find "javac"))))))))
+          `(:settings (:java (:home ,home)))
+        (ignore (eglot--warn "JAVA_HOME env var not set")))))
 
 
 ;; FIXME: A horrible hack of Flymake's insufficient API that must go

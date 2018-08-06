@@ -181,6 +181,7 @@ lasted more than that many seconds."
              :definition         `(:dynamicRegistration :json-false)
              :documentSymbol     `(:dynamicRegistration :json-false)
              :documentHighlight  `(:dynamicRegistration :json-false)
+             :codeLens           `(:dynamicRegistration :json-false)
              :codeAction         `(:dynamicRegistration :json-false)
              :formatting         `(:dynamicRegistration :json-false)
              :rangeFormatting    `(:dynamicRegistration :json-false)
@@ -701,7 +702,8 @@ If optional MARKERS, make markers."
                   #'eglot-eldoc-function)
     (add-function :around (local 'imenu-create-index-function) #'eglot-imenu)
     (flymake-mode 1)
-    (eldoc-mode 1))
+    (eldoc-mode 1)
+    (eglot--code-lens))
    (t
     (remove-hook 'flymake-diagnostic-functions 'eglot-flymake-backend t)
     (remove-hook 'after-change-functions 'eglot--after-change t)
@@ -716,7 +718,8 @@ If optional MARKERS, make markers."
     (remove-function (local 'eldoc-documentation-function)
                      #'eglot-eldoc-function)
     (remove-function (local 'imenu-create-index-function) #'eglot-imenu)
-    (setq eglot--current-flymake-report-fn nil))))
+    (setq eglot--current-flymake-report-fn nil)
+    (eglot--clear-code-lens))))
 
 (defvar-local eglot--cached-current-server nil
   "A cached reference to the current EGLOT server.
@@ -1037,7 +1040,9 @@ Records START, END and PRE-CHANGE-LENGTH locally."
            0.5 nil (lambda () (eglot--with-live-buffer buf
                                 (when eglot--managed-mode
                                   (eglot--signal-textDocument/didChange)
-                                  (setq eglot--change-idle-timer nil))))))))
+                                  (setq eglot--change-idle-timer nil)
+                                  ;; Ensure this function never exits abnormally.
+                                  (ignore-errors (eglot--code-lens)))))))))
 
 ;; HACK! Launching a deferred sync request with outstanding changes is a
 ;; bad idea, since that might lead to the request never having a
@@ -1318,6 +1323,54 @@ is not active."
        :exit-function (lambda (_string _status)
                         (eglot--signal-textDocument/didChange)
                         (eglot-eldoc-function))))))
+
+(defvar-local eglot--code-lens nil "Overlays for textDocument/codeLens.")
+
+(defun eglot--clear-code-lens ()
+  (mapc #'delete-overlay eglot--code-lens)
+  (setq eglot--code-lens nil))
+
+(defun eglot--resolve-code-lens (overlay)
+  "Resolve codeLens in overlay if it's missing and server is capable.
+Return the resolved or original LSP CodeLens object."
+  (with-current-buffer (overlay-buffer overlay)
+    (unless (or (not (eglot--server-capable :codeLensProvider :resolveProvider))
+                (plist-member (overlay-get overlay 'eglot-code-lens) :command))
+      (overlay-put overlay 'eglot-code-lens
+                   (jsonrpc-request
+                    (eglot--current-server-or-lose)
+                    :codeLens/resolve
+                    (overlay-get overlay 'eglot-code-lens)))))
+  (overlay-get overlay 'eglot-code-lens))
+
+(defun eglot--code-lens ()
+  (interactive)
+  (when (eglot--server-capable :codeLensProvider)
+    (let ((buffer (current-buffer)))
+      (jsonrpc-async-request
+       (eglot--current-server-or-lose)
+       :textDocument/codeLens
+       (list :textDocument (eglot--TextDocumentIdentifier))
+       :success-fn
+       (lambda (result)
+         (eglot--with-live-buffer buffer
+           (eglot--clear-code-lens)
+           (mapc (lambda (codeLens)
+                   (pcase-let* ((range (plist-get codeLens :range))
+                                (`(,beg . ,end) (eglot--range-region range))
+                                (ov (make-overlay beg end)))
+                     (push ov eglot--code-lens)
+                     (overlay-put ov 'face 'underline)
+                     (overlay-put ov 'mouse-face 'highlight)
+                     (overlay-put ov 'eglot-code-lens codeLens)
+                     (overlay-put ov 'help-echo
+                                  (lambda (&rest args)
+                                    (cl-destructuring-bind (&key title command arguments)
+                                        (plist-get (eglot--resolve-code-lens ov)
+                                                   :command)
+                                      (concat title "\n\nmouse-1: " command))))))
+                 result)))
+       :deferred :textDocument/codeLens))))
 
 (defvar eglot--highlights nil "Overlays for textDocument/documentHighlight.")
 

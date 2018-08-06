@@ -209,6 +209,7 @@ let the buffer grow forever."
              :definition         `(:dynamicRegistration :json-false)
              :documentSymbol     `(:dynamicRegistration :json-false)
              :documentHighlight  `(:dynamicRegistration :json-false)
+             :codeLens           `(:dynamicRegistration :json-false)
              :codeAction         `(:dynamicRegistration :json-false)
              :formatting         `(:dynamicRegistration :json-false)
              :rangeFormatting    `(:dynamicRegistration :json-false)
@@ -797,7 +798,8 @@ and just return it.  PROMPT shouldn't end with a question mark."
                   #'eglot-eldoc-function)
     (add-function :around (local 'imenu-create-index-function) #'eglot-imenu)
     (flymake-mode 1)
-    (eldoc-mode 1))
+    (eldoc-mode 1)
+    (eglot--code-lens))
    (t
     (remove-hook 'flymake-diagnostic-functions 'eglot-flymake-backend t)
     (remove-hook 'after-change-functions 'eglot--after-change t)
@@ -812,7 +814,8 @@ and just return it.  PROMPT shouldn't end with a question mark."
     (remove-function (local 'eldoc-documentation-function)
                      #'eglot-eldoc-function)
     (remove-function (local 'imenu-create-index-function) #'eglot-imenu)
-    (setq eglot--current-flymake-report-fn nil))))
+    (setq eglot--current-flymake-report-fn nil)
+    (eglot--clear-code-lens))))
 
 (defvar-local eglot--cached-current-server nil
   "A cached reference to the current EGLOT server.
@@ -1140,7 +1143,9 @@ Records START, END and PRE-CHANGE-LENGTH locally."
            0.5 nil (lambda () (eglot--with-live-buffer buf
                                 (when eglot--managed-mode
                                   (eglot--signal-textDocument/didChange)
-                                  (setq eglot--change-idle-timer nil))))))))
+                                  (setq eglot--change-idle-timer nil)
+                                  ;; Ensure this function never exits abnormally.
+                                  (ignore-errors (eglot--code-lens)))))))))
 
 ;; HACK! Launching a deferred sync request with outstanding changes is a
 ;; bad idea, since that might lead to the request never having a
@@ -1429,6 +1434,63 @@ is not active."
                         (eglot--signal-textDocument/didChange)
                         (eglot-eldoc-function))))))
 
+(defface eglot-code-lens
+  '((t (:inherit underline)))
+  "Face used for code lens.")
+
+(defun eglot--clear-code-lens ()
+  ;; TODO: Perhaps we should store code lens overlays in a variable, so that we
+  ;; can clear them more quickly
+  (remove-overlays nil nil 'eglot-code-lens-p t))
+
+(defun eglot--resolve-code-lens (overlay)
+  "Resolve codeLens in overlay if it's missing and server is capable.
+Return the resolved or original LSP CodeLens object."
+  (with-current-buffer (overlay-buffer overlay)
+    (unless (or (not (eglot--server-capable :codeLensProvider :resolveProvider))
+                (plist-member (overlay-get overlay 'eglot-code-lens) :command))
+      (overlay-put overlay 'eglot-code-lens
+                   (jsonrpc-request
+                    (eglot--current-server-or-lose)
+                    :codeLens/resolve
+                    (overlay-get overlay 'eglot-code-lens)))))
+  (overlay-get overlay 'eglot-code-lens))
+
+(defun eglot--code-lens ()
+  (interactive)
+  (when (eglot--server-capable :codeLensProvider)
+    (let ((buffer (current-buffer)))
+      (jsonrpc-async-request
+       (eglot--current-server-or-lose)
+       :textDocument/codeLens
+       (list :textDocument (eglot--TextDocumentIdentifier))
+       :success-fn
+       (lambda (result)
+         (eglot--with-live-buffer buffer
+           (eglot--clear-code-lens)
+           (mapc (lambda (codeLens)
+                   (pcase-let* ((range (plist-get codeLens :range))
+                                (`(,beg . ,end) (eglot--range-region range))
+                                (ov (make-overlay beg end)))
+                     (overlay-put ov 'face 'eglot-code-lens)
+                     (overlay-put ov 'evaporate t)
+                     (overlay-put ov 'mouse-face 'highlight)
+                     (overlay-put ov 'eglot-code-lens-p t)
+                     (overlay-put ov 'eglot-code-lens codeLens)
+                     (overlay-put ov 'help-echo
+                                  (lambda (&rest _args)
+                                    (cl-destructuring-bind
+                                        (&key title command _arguments)
+                                        (plist-get (eglot--resolve-code-lens ov)
+                                                   :command)
+                                      (concat title "\n\nmouse-1: " command))))
+                     (overlay-put ov 'keymap
+                                  (let ((map (make-sparse-keymap)))
+                                    (define-key map [mouse-1] #'eglot-code-actions)
+                                    map))))
+                 result)))
+       :deferred :textDocument/codeLens))))
+
 (defvar eglot--highlights nil "Overlays for textDocument/documentHighlight.")
 
 (defun eglot--hover-info (contents &optional range)
@@ -1638,45 +1700,61 @@ If SKIP-SIGNATURE, don't try to send textDocument/signatureHelp."
 (defun eglot-code-actions (&optional beg end)
   "Get and offer to execute code actions between BEG and END."
   (interactive
-   (let (diags)
+   (let (diags codelens)
      (cond ((region-active-p) (list (region-beginning) (region-end)))
            ((setq diags (flymake-diagnostics (point)))
             (list (cl-reduce #'min (mapcar #'flymake-diagnostic-beg diags))
                   (cl-reduce #'max (mapcar #'flymake-diagnostic-end diags))))
+           ((setq codelens (cl-find-if
+                            (lambda (ov) (overlay-get ov 'eglot-code-lens))
+                            (overlays-at (point))))
+            (list (overlay-start codelens) (overlay-end codelens)))
            (t (list (point-min) (point-max))))))
-  (unless (eglot--server-capable :codeActionProvider)
-    (eglot--error "Server can't execute code actions!"))
-  (let* ((server (eglot--current-server-or-lose))
-         (actions (jsonrpc-request
-                   server
-                   :textDocument/codeAction
-                   (list :textDocument (eglot--TextDocumentIdentifier)
-                         :range (list :start (eglot--pos-to-lsp-position beg)
-                                      :end (eglot--pos-to-lsp-position end))
-                         :context
-                         `(:diagnostics
-                           [,@(mapcar (lambda (diag)
-                                        (cdr (assoc 'eglot-lsp-diag
-                                                    (eglot--diag-data diag))))
-                                      (flymake-diagnostics beg end))]))))
-         (menu-items (mapcar (jsonrpc-lambda (&key title command arguments)
-                               `(,title . (:command ,command :arguments ,arguments)))
-                             actions))
-         (menu (and menu-items `("Eglot code actions:" ("dummy" ,@menu-items))))
-         (command-and-args
-          (and menu
-               (if (listp last-nonmenu-event)
-                   (x-popup-menu last-nonmenu-event menu)
-                 (let ((never-mind (gensym)) retval)
-                   (setcdr (cadr menu)
-                           (cons `("never mind..." . ,never-mind) (cdadr menu)))
-                   (if (eq (setq retval (tmm-prompt menu)) never-mind)
-                       (keyboard-quit)
-                     retval))))))
-    (cl-destructuring-bind (&key _title command arguments) command-and-args
-      (if command
-          (eglot-execute-command server (intern command) arguments)
-        (eglot--message "No code actions here")))))
+  (let (codelens-cmd)
+    (cond
+     ((setq codelens-cmd
+            (and (null (flymake-diagnostics beg end))
+                 (cl-loop for ov being the overlays from beg to end
+                          when (overlay-get ov 'eglot-code-lens)
+                          return (plist-get (eglot--resolve-code-lens ov)
+                                            :command))))
+      (eglot-execute-command (eglot--current-server-or-lose)
+                             (intern (plist-get codelens-cmd :command))
+                             (plist-get codelens-cmd :arguments)))
+     (t
+      (unless (eglot--server-capable :codeActionProvider)
+        (eglot--error "Server can't execute code actions!"))
+      (let* ((server (eglot--current-server-or-lose))
+             (actions (jsonrpc-request
+                       server
+                       :textDocument/codeAction
+                       (list :textDocument (eglot--TextDocumentIdentifier)
+                             :range (list :start (eglot--pos-to-lsp-position beg)
+                                          :end (eglot--pos-to-lsp-position end))
+                             :context
+                             `(:diagnostics
+                               [,@(mapcar (lambda (diag)
+                                            (cdr (assoc 'eglot-lsp-diag
+                                                        (eglot--diag-data diag))))
+                                          (flymake-diagnostics beg end))]))))
+             (menu-items (mapcar (jsonrpc-lambda (&key title command arguments)
+                                   `(,title . (:command ,command :arguments ,arguments)))
+                                 actions))
+             (menu (and menu-items `("Eglot code actions:" ("dummy" ,@menu-items))))
+             (command-and-args
+              (and menu
+                   (if (listp last-nonmenu-event)
+                       (x-popup-menu last-nonmenu-event menu)
+                     (let ((never-mind (gensym)) retval)
+                       (setcdr (cadr menu)
+                               (cons `("never mind..." . ,never-mind) (cdadr menu)))
+                       (if (eq (setq retval (tmm-prompt menu)) never-mind)
+                           (keyboard-quit)
+                         retval))))))
+        (cl-destructuring-bind (&key _title command arguments) command-and-args
+          (if command
+              (eglot-execute-command server (intern command) arguments)
+            (eglot--message "No code actions here"))))))))
 
 
 

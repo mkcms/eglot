@@ -1543,7 +1543,9 @@ If SKIP-SIGNATURE, don't try to send textDocument/signatureHelp."
                           ;; https://debbugs.gnu.org/cgi/bugreport.cgi?bug=32237
                           ;; https://debbugs.gnu.org/cgi/bugreport.cgi?bug=32278
                           (let ((inhibit-modification-hooks t)
-                                (length (- end beg)))
+                                (length (- end beg))
+                                (beg (marker-position beg))
+                                (end (marker-position end)))
                             (run-hook-with-args 'before-change-functions
                                                 beg end)
                             (replace-buffer-contents temp)
@@ -1552,7 +1554,16 @@ If SKIP-SIGNATURE, don't try to send textDocument/signatureHelp."
                                                 length))))
                       (progress-reporter-update reporter (cl-incf done)))))))
             (mapcar (jsonrpc-lambda (&key range newText)
-                      (cons newText (eglot--range-region range 'markers)))
+                      (pcase-let ((`(,beg . ,end) (eglot--range-region range t)))
+                        ;; LSP requires that if there are multiple insertions
+                        ;; at the same position, the order of inserted text in
+                        ;; the document is the same as the order of the
+                        ;; TextEdit in a TextEdit[] array, so we make the
+                        ;; markers move when something is inserted right in
+                        ;; front of them.
+                        (set-marker-insertion-type beg t)
+                        (set-marker-insertion-type end t)
+                        (cons newText (cons beg end))))
                     edits))
       (undo-amalgamate-change-group change-group)
       (progress-reporter-done reporter))))

@@ -90,7 +90,8 @@
                                     :autoport))
                                 (php-mode . ("php" "vendor/felixfbecker/\
 language-server/bin/php-language-server.php"))
-                                (haskell-mode . ("hie-wrapper")))
+                                (haskell-mode . ("hie-wrapper"))
+                                (java-mode . eglot--java-contact))
   "How the command `eglot' guesses the server to start.
 An association list of (MAJOR-MODE . CONTACT) pairs.  MAJOR-MODE
 is a mode symbol, or a list of mode symbols.  The associated
@@ -121,7 +122,62 @@ of those modes.  CONTACT can be:
   converted to produce a plist with a suitable :PROCESS initarg
   to CLASS-NAME.  The class `eglot-lsp-server' descends
   `jsonrpc-process-connection', which you should see for the
-  semantics of the mandatory :PROCESS argument.")
+  semantics of the mandatory :PROCESS argument.
+
+* A unary function producing any of the above values for CONTACT.
+  The function will be called with non-nil argument if the
+  connection was requested interactively (as opposed to e.g. from
+  `eglot-ensure') and a nil argument otherwise.")
+
+(defun eglot--java-contact (interactive)
+  "Return a contact for connecting to eclipse.jdt.ls server, as a cons cell."
+  (cl-labels
+      ((is-the-jar
+        (path)
+        (string-match-p
+         "org\\.eclipse\\.equinox\\.launcher_.*.jar$"
+         (file-name-nondirectory path))))
+    (let* ((classpath (or (getenv "CLASSPATH") ":"))
+           (jar (cl-find-if #'is-the-jar (split-string classpath ":")))
+           (dir
+            (cond
+             (jar (expand-file-name ".." (file-name-directory jar)))
+             (interactive
+              (read-directory-name
+               (concat "Path to eclipse.jdt.ls directory (could not"
+                       " find it in CLASSPATH): ")
+               nil nil t))
+             (t (error "Could not find eclipse.jdt.ls jar"))))
+           (repodir
+            (file-name-as-directory
+             (concat dir
+                     "org.eclipse.jdt.ls.product/target/repository")))
+           (config
+            (concat
+             repodir
+             (cond
+              ((string= system-type "darwin") "config_mac")
+              ((string= system-type "windows-nt") "config_win")
+              (t "config_linux"))))
+           (workspace (make-temp-file "eglot-workspace" t)))
+      (unless jar
+        (setq jar
+              (cl-find-if #'is-the-jar
+                          (directory-files (concat repodir "plugins") t))))
+      (unless (and jar (file-exists-p jar) (file-directory-p config))
+        (error "Could not find required eclipse.jdt.ls files ('mvn package' required?)"))
+      (cons 'eglot-eclipse-jdt
+            (list (executable-find "java")
+                  "-Declipse.application=org.eclipse.jdt.ls.core.id1"
+                  "-Dosgi.bundles.defaultStartLevel=4"
+                  "-Declipse.product=org.eclipse.jdt.ls.core.product"
+                  "-Dlog.protocol=true"
+                  "-Dlog.level=ALL"
+                  "-noverify"
+                  "-Xmx1G"
+                  "-jar" jar
+                  "-configuration" config
+                  "-data" workspace)))))
 
 (defface eglot-mode-line
   '((t (:inherit font-lock-constant-face :weight bold)))
@@ -154,6 +210,9 @@ lasted more than that many seconds."
 
 (cl-defgeneric eglot-handle-notification (server method id &rest params)
   "Handle SERVER's METHOD notification with PARAMS.")
+
+(cl-defgeneric eglot-execute-command (server command arguments)
+  "Execute on SERVER COMMAND with ARGUMENTS.")
 
 (cl-defgeneric eglot-initialization-options (server)
   "JSON object to send under `initializationOptions'"
@@ -310,6 +369,9 @@ be guessed."
                             (lambda (m1 m2)
                               (or (eq m1 m2)
                                   (and (listp m1) (memq m2 m1)))))))
+         (guess (if (functionp guess)
+                    (funcall guess interactive)
+                  guess))
          (class (or (and (consp guess) (symbolp (car guess))
                          (prog1 (car guess) (setq guess (cdr guess))))
                     'eglot-lsp-server))
@@ -457,6 +519,7 @@ This docstring appeases checkdoc, that's all."
          (nickname (file-name-base (directory-file-name default-directory)))
          (readable-name (format "EGLOT (%s/%s)" nickname managed-major-mode))
          autostart-inferior-process
+         (contact (if (functionp contact) (funcall contact) contact))
          (initargs
           (cond ((keywordp (car contact)) contact)
                 ((integerp (cadr contact))
@@ -881,6 +944,14 @@ Uses THING, FACE, DEFS and PREPEND."
   "Handle unknown request"
   (jsonrpc-error "Unknown request method `%s'" method))
 
+(cl-defmethod eglot-execute-command
+  (server command arguments)
+  "Execute command by making a :workspace/executeCommand request."
+  (jsonrpc-request
+   server
+   :workspace/executeCommand
+   `(:command ,command :arguments ,arguments)))
+
 (cl-defmethod eglot-handle-notification
   (_server (_method (eql window/showMessage)) &key type message)
   "Handle notification window/showMessage"
@@ -1062,7 +1133,10 @@ When called interactively, use the currently active server"
    (list
     :settings
     (cl-loop for (k . v) in eglot-workspace-configuration
-             collect k collect v))))
+             collect (if (keywordp k)
+                         k
+                       (intern (format ":%s" k)))
+             collect v))))
 
 (defun eglot--signal-textDocument/didChange ()
   "Send textDocument/didChange to server."
@@ -1565,7 +1639,8 @@ If SKIP-SIGNATURE, don't try to send textDocument/signatureHelp."
                        (keyboard-quit)
                      retval))))))
     (if command-and-args
-        (jsonrpc-request server :workspace/executeCommand command-and-args)
+        (eglot-execute-command server (plist-get command-and-args :command)
+                               (plist-get command-and-args :arguments))
       (eglot--message "No code actions here"))))
 
 
@@ -1658,6 +1733,29 @@ If SKIP-SIGNATURE, don't try to send textDocument/signatureHelp."
          (cache (expand-file-name ".cquery_cached_index/" root)))
     (list :cacheDirectory (file-name-as-directory cache)
           :progressReportFrequencyMs -1)))
+
+
+;;; eclipse-jdt-specific
+;;;
+(defclass eglot-eclipse-jdt (eglot-lsp-server) ()
+  :documentation "eclipse's jdt langserver.")
+
+(cl-defmethod eglot-execute-command
+  ((_server eglot-eclipse-jdt) command arguments)
+  (cond ((string= command "java.apply.workspaceEdit")
+         (mapc #'eglot--apply-workspace-edit arguments))
+        (t (cl-call-next-method))))
+
+(cl-defmethod eglot-initialization-options ((server eglot-eclipse-jdt))
+  "Passes through required jdt initialization options"
+  (if-let ((home (or (getenv "JAVA_HOME")
+                     (ignore-errors
+                       (expand-file-name
+                        ".."
+                        (file-name-directory
+                         (file-chase-links (executable-find "javac"))))))))
+      `(:settings (:java (:home ,home)))
+    (ignore (eglot--warn "JAVA_HOME env var not set"))))
 
 
 ;; FIXME: A horrible hack of Flymake's insufficient API that must go

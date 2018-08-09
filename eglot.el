@@ -1739,6 +1739,12 @@ If SKIP-SIGNATURE, don't try to send textDocument/signatureHelp."
 (defclass eglot-eclipse-jdt (eglot-lsp-server) ()
   :documentation "eclipse's jdt langserver.")
 
+(cl-defmethod eglot-execute-command
+  ((_server eglot-eclipse-jdt) command arguments)
+  (cond ((string= command "java.apply.workspaceEdit")
+         (mapc #'eglot--apply-workspace-edit arguments))
+        (t (cl-call-next-method))))
+
 (cl-defmethod eglot-initialization-options ((server eglot-eclipse-jdt))
   "Passes through required jdt initialization options"
   (if-let ((home (or (getenv "JAVA_HOME")

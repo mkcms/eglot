@@ -90,7 +90,8 @@
                                     :autoport))
                                 (php-mode . ("php" "vendor/felixfbecker/\
 language-server/bin/php-language-server.php"))
-                                (haskell-mode . ("hie-wrapper")))
+                                (haskell-mode . ("hie-wrapper"))
+                                (java-mode . eglot--java-contact))
   "How the command `eglot' guesses the server to start.
 An association list of (MAJOR-MODE . CONTACT) pairs.  MAJOR-MODE
 is a mode symbol, or a list of mode symbols.  The associated
@@ -128,6 +129,55 @@ of those modes.  CONTACT can be:
   connection was requested interactively (as opposed to e.g. from
   `eglot-ensure') and a nil argument otherwise.")
 
+(defun eglot--java-contact (interactive)
+  "Return a contact for connecting to eclipse.jdt.ls server, as a cons cell."
+  (cl-labels
+      ((is-the-jar
+        (path)
+        (string-match-p
+         "org\\.eclipse\\.equinox\\.launcher_.*.jar$"
+         (file-name-nondirectory path))))
+    (let* ((classpath (or (getenv "CLASSPATH") ":"))
+           (jar (cl-find-if #'is-the-jar (split-string classpath ":")))
+           (dir
+            (cond
+             (jar (expand-file-name ".." (file-name-directory jar)))
+             (interactive
+              (read-directory-name
+               (concat "Path to eclipse.jdt.ls directory (could not"
+                       " find it in CLASSPATH): ")
+               nil nil t))
+             (t (error "Could not find eclipse.jdt.ls jar"))))
+           (repodir
+            (file-name-as-directory
+             (concat dir
+                     "org.eclipse.jdt.ls.product/target/repository")))
+           (config
+            (concat
+             repodir
+             (cond
+              ((string= system-type "darwin") "config_mac")
+              ((string= system-type "windows-nt") "config_win")
+              (t "config_linux"))))
+           (workspace (make-temp-file "eglot-workspace" t)))
+      (unless jar
+        (setq jar
+              (cl-find-if #'is-the-jar
+                          (directory-files (concat repodir "plugins") t))))
+      (unless (and jar (file-exists-p jar) (file-directory-p config))
+        (error "Could not find required eclipse.jdt.ls files ('mvn package' required?)"))
+      (cons 'eglot-eclipse-jdt
+            (list (executable-find "java")
+                  "-Declipse.application=org.eclipse.jdt.ls.core.id1"
+                  "-Dosgi.bundles.defaultStartLevel=4"
+                  "-Declipse.product=org.eclipse.jdt.ls.core.product"
+                  "-Dlog.protocol=true"
+                  "-Dlog.level=ALL"
+                  "-noverify"
+                  "-Xmx1G"
+                  "-jar" jar
+                  "-configuration" config
+                  "-data" workspace)))))
 
 (defface eglot-mode-line
   '((t (:inherit font-lock-constant-face :weight bold)))
@@ -1670,6 +1720,23 @@ If SKIP-SIGNATURE, don't try to send textDocument/signatureHelp."
          (cache (expand-file-name ".cquery_cached_index/" root)))
     (list :cacheDirectory (file-name-as-directory cache)
           :progressReportFrequencyMs -1)))
+
+
+;;; eclipse-jdt-specific
+;;;
+(defclass eglot-eclipse-jdt (eglot-lsp-server) ()
+  :documentation "eclipse's jdt langserver.")
+
+(cl-defmethod eglot-initialization-options ((server eglot-eclipse-jdt))
+  "Passes through required jdt initialization options"
+  (if-let ((home (or (getenv "JAVA_HOME")
+                     (ignore-errors
+                       (expand-file-name
+                        ".."
+                        (file-name-directory
+                         (file-chase-links (executable-find "javac"))))))))
+      `(:settings (:java (:home ,home)))
+    (ignore (eglot--warn "JAVA_HOME env var not set"))))
 
 
 ;; FIXME: A horrible hack of Flymake's insufficient API that must go

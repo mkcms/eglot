@@ -123,8 +123,11 @@ of those modes.  CONTACT can be:
   `jsonrpc-process-connection', which you should see for the
   semantics of the mandatory :PROCESS argument.
 
-* A function of no arguments producing any of the above values
-  for CONTACT.")
+* A unary function producing any of the above values for CONTACT.
+  The function will be called with non-nil argument if the
+  connection was requested interactively (as opposed to e.g. from
+  `eglot-ensure') and a nil argument otherwise.")
+
 
 (defface eglot-mode-line
   '((t (:inherit font-lock-constant-face :weight bold)))
@@ -313,7 +316,9 @@ be guessed."
                             (lambda (m1 m2)
                               (or (eq m1 m2)
                                   (and (listp m1) (memq m2 m1)))))))
-         (guess (if (functionp guess) (funcall guess) guess))
+         (guess (if (functionp guess)
+                    (funcall guess interactive)
+                  guess))
          (class (or (and (consp guess) (symbolp (car guess))
                          (prog1 (car guess) (setq guess (cdr guess))))
                     'eglot-lsp-server))

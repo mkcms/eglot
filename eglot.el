@@ -765,7 +765,8 @@ If optional MARKERS, make markers."
                   #'eglot-eldoc-function)
     (add-function :around (local 'imenu-create-index-function) #'eglot-imenu)
     (flymake-mode 1)
-    (eldoc-mode 1))
+    (eldoc-mode 1)
+    (eglot--code-lens))
    (t
     (remove-hook 'flymake-diagnostic-functions 'eglot-flymake-backend t)
     (remove-hook 'after-change-functions 'eglot--after-change t)
@@ -1408,7 +1409,7 @@ is not active."
   "Resolve codeLens in overlay if it's missing and server is capable.
 Return the resolved or original LSP CodeLens object."
   (with-current-buffer (overlay-buffer overlay)
-    (unless (or (eglot--server-capable :codeLensProvider :resolveProvider)
+    (unless (or (not (eglot--server-capable :codeLensProvider :resolveProvider))
                 (plist-member (overlay-get overlay 'eglot-code-lens) :command))
       (overlay-put overlay 'eglot-code-lens
                    (jsonrpc-request
@@ -1419,32 +1420,32 @@ Return the resolved or original LSP CodeLens object."
 
 (defun eglot--code-lens ()
   (interactive)
-  ;; (when (eglot--server-capable :codeLensProvider))
-  (let ((buffer (current-buffer)))
-    (jsonrpc-async-request
-     (eglot--current-server-or-lose)
-     :textDocument/codeLens
-     (list :textDocument (eglot--TextDocumentIdentifier))
-     :success-fn
-     (lambda (result)
-       (with-current-buffer buffer
-         (eglot--clear-code-lens)
-         (mapc (lambda (codeLens)
-                 (pcase-let* ((range (plist-get codeLens :range))
-                              (`(,beg . ,end) (eglot--range-region range))
-                              (ov (make-overlay beg end)))
-                   (push ov eglot--code-lens)
-                   (overlay-put ov 'face 'underline)
-                   (overlay-put ov 'mouse-face 'highlight)
-                   (overlay-put ov 'eglot-code-lens codeLens)
-                   (overlay-put ov 'help-echo
-                                (lambda (&rest args)
-                                  (cl-destructuring-bind (&key title command arguments)
-                                      (plist-get (eglot--resolve-code-lens ov)
-                                                 :command)
-                                    (concat title "\n\nmouse-1: " command))))))
-               result)))
-     :deferred :textDocument/codeLens)))
+  (when (eglot--server-capable :codeLensProvider)
+    (let ((buffer (current-buffer)))
+      (jsonrpc-async-request
+       (eglot--current-server-or-lose)
+       :textDocument/codeLens
+       (list :textDocument (eglot--TextDocumentIdentifier))
+       :success-fn
+       (lambda (result)
+         (eglot--with-live-buffer buffer
+           (eglot--clear-code-lens)
+           (mapc (lambda (codeLens)
+                   (pcase-let* ((range (plist-get codeLens :range))
+                                (`(,beg . ,end) (eglot--range-region range))
+                                (ov (make-overlay beg end)))
+                     (push ov eglot--code-lens)
+                     (overlay-put ov 'face 'underline)
+                     (overlay-put ov 'mouse-face 'highlight)
+                     (overlay-put ov 'eglot-code-lens codeLens)
+                     (overlay-put ov 'help-echo
+                                  (lambda (&rest args)
+                                    (cl-destructuring-bind (&key title command arguments)
+                                        (plist-get (eglot--resolve-code-lens ov)
+                                                   :command)
+                                      (concat title "\n\nmouse-1: " command))))))
+                 result)))
+       :deferred :textDocument/codeLens))))
 
 (defvar eglot--highlights nil "Overlays for textDocument/documentHighlight.")
 

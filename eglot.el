@@ -77,6 +77,12 @@
   :prefix "eglot-"
   :group 'applications)
 
+(defcustom eglot-debug nil
+  "Enable protocol debugging.
+When non-nil, LSP events are logged into a special buffer.
+You can show the buffer with `eglot-events-buffer'."
+  :type 'boolean)
+
 (defvar eglot-server-programs '((rust-mode . (eglot-rls "rls"))
                                 (python-mode . ("pyls"))
                                 ((js-mode
@@ -167,7 +173,8 @@ as 0, i.e. don't block at all."
   "Control the size of the Eglot events buffer.
 If a number, don't let the buffer grow larger than that many
 characters.  If 0, don't use an event's buffer at all.  If nil,
-let the buffer grow forever."
+let the buffer grow forever.
+This variable only has meaning when `eglot-debug' is non-nil."
   :type '(choice (const :tag "No limit" nil)
                  (integer :tag "Number of characters")))
 
@@ -534,7 +541,9 @@ This docstring appeases checkdoc, that's all."
           (apply
            #'make-instance class
            :name readable-name
-           :events-buffer-scrollback-size eglot-events-buffer-size
+           :events-buffer-scrollback-size (if eglot-debug
+                                              eglot-events-buffer-size
+                                            0)
            :notification-dispatcher (funcall spread #'eglot-handle-notification)
            :request-dispatcher (funcall spread #'eglot-handle-request)
            :on-shutdown #'eglot--on-shutdown
@@ -586,6 +595,11 @@ This docstring appeases checkdoc, that's all."
                                            (null eglot-autoreconnect)))))))
                           (run-hook-with-args 'eglot-connect-hook server)
                           (run-hook-with-args 'eglot-server-initialized-hook server)
+                          (unless eglot-debug
+                            (with-current-buffer (jsonrpc-events-buffer server)
+                              (rename-buffer (concat " " (buffer-name))))
+                            (with-current-buffer (jsonrpc-stderr-buffer server)
+                              (rename-buffer (concat " " (buffer-name)))))
                           (eglot--message
                            "Connected! Server `%s' now managing `%s' buffers \
 in project `%s'."

@@ -205,6 +205,15 @@ let the buffer grow forever."
   (let ((b (cl-gensym)))
     `(let ((,b ,buf)) (if (buffer-live-p ,b) (with-current-buffer ,b ,@body)))))
 
+(cl-defmacro eglot--destructuring-bind (args expr &rest body)
+  "Like `cl-destructuring-bind', but always allow other keys."
+  (declare (indent 2) (debug (sexp sexp body)))
+  `(cl-destructuring-bind
+       ,(append args (and (memq '&key args) (not (memq '&allow-other-keys args))
+                          '(&allow-other-keys)))
+       ,expr
+     ,@body))
+
 (cl-defmacro eglot--widening (&rest body)
   "Save excursion and restriction. Widen. Then run BODY." (declare (debug t))
   `(save-excursion (save-restriction (widen) ,@body)))
@@ -1146,9 +1155,8 @@ COMMAND is a symbol naming the command."
       (with-current-buffer buffer
         (cl-loop
          for diag-spec across diagnostics
-         collect (cl-destructuring-bind (&key range ((:severity sev)) _group
-                                              _code source message
-                                              &allow-other-keys)
+         collect (eglot--destructuring-bind (&key range ((:severity sev))
+                                                  source message)
                      diag-spec
                    (setq message (concat source ": " message))
                    (pcase-let
@@ -1188,7 +1196,7 @@ COMMAND is a symbol naming the command."
 THINGS are either registrations or unregisterations."
   (cl-loop
    for thing in (cl-coerce things 'list)
-   collect (cl-destructuring-bind (&key id method registerOptions) thing
+   collect (eglot--destructuring-bind (&key id method registerOptions) thing
              (apply (intern (format "eglot--%s-%s" how method))
                     server :id id registerOptions))
    into results
@@ -1392,7 +1400,7 @@ DUMMY is ignored."
 
 (defun eglot--xref-make (name uri position)
   "Like `xref-make' but with LSP's NAME, URI and POSITION."
-  (cl-destructuring-bind (&key line character) position
+  (eglot--destructuring-bind (&key line character) position
     (xref-make name (xref-make-file-location
                      (eglot--uri-to-path uri)
                      ;; F!@(#*&#$)CKING OFF-BY-ONE again
@@ -1477,7 +1485,7 @@ DUMMY is ignored."
     (eglot--sort-xrefs
      (mapcar
       (jsonrpc-lambda (&key name location &allow-other-keys)
-        (cl-destructuring-bind (&key uri range) location
+        (eglot--destructuring-bind (&key uri range) location
           (eglot--xref-make name uri (plist-get range :start))))
       (jsonrpc-request (eglot--current-server-or-lose)
                        :workspace/symbol
@@ -1552,8 +1560,7 @@ is not active."
               items)))))
        :annotation-function
        (lambda (obj)
-         (cl-destructuring-bind (&key detail kind insertTextFormat
-                                      &allow-other-keys)
+         (eglot--destructuring-bind (&key detail kind insertTextFormat)
              (text-properties-at 0 obj)
            (let* ((detail (and (stringp detail)
                                (not (string= detail ""))
@@ -1603,12 +1610,11 @@ is not active."
                        ;; buffer, `comp' won't have any properties.  A
                        ;; lookup should fix that (github#148)
                        (cl-find comp strings :test #'string=))))
-           (cl-destructuring-bind (&key insertTextFormat
-                                        insertText
-                                        textEdit
-                                        additionalTextEdits
-                                        bounds
-                                        &allow-other-keys)
+           (eglot--destructuring-bind (&key insertTextFormat
+                                            insertText
+                                            textEdit
+                                            additionalTextEdits
+                                            bounds)
                (text-properties-at 0 comp)
              (let ((fn (and (eql insertTextFormat 2)
                             (eglot--snippet-expansion-fn))))
@@ -1621,7 +1627,7 @@ is not active."
                                    (if bounds (- (cdr bounds) (car bounds)) 0))
                                 (point)))
                (cond (textEdit
-                      (cl-destructuring-bind (&key range newText) textEdit
+                      (eglot--destructuring-bind (&key range newText) textEdit
                         (pcase-let ((`(,beg . ,end) (eglot--range-region range)))
                           (delete-region beg end)
                           (goto-char beg)
@@ -1643,7 +1649,7 @@ is not active."
 (defun eglot--sig-info (sigs active-sig active-param)
   (cl-loop
    for (sig . moresigs) on (append sigs nil) for i from 0
-   concat (cl-destructuring-bind (&key label documentation parameters) sig
+   concat (eglot--destructuring-bind (&key label documentation parameters) sig
             (with-temp-buffer
               (save-excursion (insert label))
               (when (looking-at "\\([^(]+\\)(")
@@ -1659,7 +1665,7 @@ is not active."
                   (insert ": " documentation)))
               (when (and (eql i active-sig) active-param
                          (< -1 active-param (length parameters)))
-                (cl-destructuring-bind (&key label documentation)
+                (eglot--destructuring-bind (&key label documentation)
                     (aref parameters active-param)
                   (goto-char (point-min))
                   (let ((case-fold-search nil))
@@ -1683,7 +1689,7 @@ is not active."
 (defun eglot-help-at-point ()
   "Request \"hover\" information for the thing at point."
   (interactive)
-  (cl-destructuring-bind (&key contents range)
+  (eglot--destructuring-bind (&key contents range)
       (jsonrpc-request (eglot--current-server-or-lose) :textDocument/hover
                        (eglot--TextDocumentPositionParams))
     (when (seq-empty-p contents) (eglot--error "No hover info here"))
@@ -1827,10 +1833,10 @@ If SKIP-SIGNATURE, don't try to send textDocument/signatureHelp."
 
 (defun eglot--apply-workspace-edit (wedit &optional confirm)
   "Apply the workspace edit WEDIT.  If CONFIRM, ask user first."
-  (cl-destructuring-bind (&key changes documentChanges) wedit
+  (eglot--destructuring-bind (&key changes documentChanges) wedit
     (let ((prepared
            (mapcar (jsonrpc-lambda (&key textDocument edits)
-                     (cl-destructuring-bind (&key uri version) textDocument
+                     (eglot--destructuring-bind (&key uri version) textDocument
                        (list (eglot--uri-to-path uri) edits version)))
                    documentChanges))
           edit)
@@ -1844,7 +1850,7 @@ If SKIP-SIGNATURE, don't try to send textDocument/signatureHelp."
                            (mapconcat #'identity (mapcar #'car prepared) "\n  ")))
             (eglot--error "User cancelled server edit")))
       (while (setq edit (car prepared))
-        (cl-destructuring-bind (path edits &optional version) edit
+        (eglot--destructuring-bind (path edits &optional version) edit
           (with-current-buffer (find-file-noselect path)
             (eglot--apply-text-edits edits version))
           (pop prepared))
@@ -1909,7 +1915,7 @@ If SKIP-SIGNATURE, don't try to send textDocument/signatureHelp."
                      (if (eq (setq retval (tmm-prompt menu)) never-mind)
                          (keyboard-quit)
                        retval)))))
-    (cl-destructuring-bind (&key _title command arguments edit) action
+    (eglot--destructuring-bind (&key command arguments edit) action
       (when edit
         (eglot--apply-workspace-edit edit))
       (when command
@@ -1939,7 +1945,7 @@ If SKIP-SIGNATURE, don't try to send textDocument/signatureHelp."
     (cl-labels
         ((handle-event
           (event)
-          (cl-destructuring-bind (desc action file &optional file1) event
+          (eglot--destructuring-bind (desc action file &optional file1) event
             (cond
              ((and (memq action '(created changed deleted))
                    (cl-find file globs
